@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Healthcare Metrics Data Pipeline - Infrastructure Stack'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'healthcare-metrics'
+    Description: 'Project name prefix for all resources'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+  
+  RedshiftAdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: 'Redshift admin password (min 8 chars, must include uppercase, lowercase, number)'
+
+Resources:
+
+  # S3 BUCKET - Data Lake
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-datalake-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Glue ETL Role
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub '${DataLakeBucket.Arn}/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Redshift Role (for S3 access)
+  RedshiftRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-redshift-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Policies:
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: '*'
+
+  # GLUE DATA CATALOG
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_curated'
+        Description: 'Healthcare Metrics Curated Layer'
+
+  # GLUE JOB 1
+  GlueJobRawToProcessed:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-raw-to-processed'
+      Description: 'Transform raw CSV to processed Parquet (Bronze to Silver)'
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: 'G.1X'
+      NumberOfWorkers: 2
+      Timeout: 60
+      Command:
+        Name: 'glueetl'
+        ScriptLocation: !Sub 's3://${DataLakeBucket}/scripts/glue_job_1_raw_to_processed.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': 'python'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--source_bucket': !Ref DataLakeBucket
+        '--target_bucket': !Ref DataLakeBucket
+      Tags:
+        Project: !Ref ProjectName
+
+  # GLUE JOB 2
+  GlueJobProcessedToCurated:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-processed-to-curated'
+      Description: 'Transform processed to curated layer (Silver to Gold)'
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: 'G.1X'
+      NumberOfWorkers: 2
+      Timeout: 60
+      Command:
+        Name: 'glueetl'
+        ScriptLocation: !Sub 's3://${DataLakeBucket}/scripts/glue_job_2_processed_to_curated.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': 'python'
+        '--enable-metrics': 'true'
+        '--source_bucket': !Ref DataLakeBucket
+        '--target_bucket': !Ref DataLakeBucket
+        '--database_name': !Ref GlueDatabase
+      Tags:
+        Project: !Ref ProjectName
+
+  # GLUE CRAWLER
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-curated-crawler'
+      Description: 'Crawl curated layer to update Glue Data Catalog'
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataLakeBucket}/curated/'
+      SchemaChangePolicy:
+        UpdateBehavior: 'UPDATE_IN_DATABASE'
+        DeleteBehavior: 'LOG'
+      Tags:
+        Project: !Ref ProjectName
+
+  # REDSHIFT SERVERLESS
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub '${ProjectName}-namespace'
+      AdminUsername: 'admin'
+      AdminUserPassword: !Ref RedshiftAdminPassword
+      DbName: 'analytics'
+      DefaultIamRoleArn: !GetAtt RedshiftRole.Arn
+      IamRoles:
+        - !GetAtt RedshiftRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    DependsOn: RedshiftNamespace
+    Properties:
+      WorkgroupName: !Sub '${ProjectName}-workgroup'
+      NamespaceName: !Sub '${ProjectName}-namespace'
+      BaseCapacity: 8
+      PubliclyAccessible: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  DataLakeBucketName:
+    Description: 'S3 Data Lake Bucket Name'
+    Value: !Ref DataLakeBucket
+
+  GlueRoleArn:
+    Description: 'Glue IAM Role ARN'
+    Value: !GetAtt GlueRole.Arn
+
+  RedshiftRoleArn:
+    Description: 'Redshift IAM Role ARN'
+    Value: !GetAtt RedshiftRole.Arn
+
+  GlueDatabaseName:
+    Description: 'Glue Data Catalog Database'
+    Value: !Ref GlueDatabase
+
+  RedshiftWorkgroupName:
+    Description: 'Redshift Serverless Workgroup Name'
+    Value: !Sub '${ProjectName}-workgroup'
+
+  RedshiftNamespaceName:
+    Description: 'Redshift Serverless Namespace Name'
+    Value: !Sub '${ProjectName}-namespace'
