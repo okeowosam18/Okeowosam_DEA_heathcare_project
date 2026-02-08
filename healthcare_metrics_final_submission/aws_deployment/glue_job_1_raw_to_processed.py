@@ -1,256 +1,196 @@
 """
-Healthcare Metrics Pipeline - AWS Glue Job 1: Raw to Processed
-==============================================================
-Transforms raw CSV data to cleaned Parquet (Bronze → Silver)
-
-Deploy to: s3://{bucket}/scripts/glue_job_1_raw_to_processed.py
-
-Arguments:
-    --source_bucket: S3 bucket name
-    --target_bucket: S3 bucket name (usually same as source)
-
-Author: Samuel
+Glue Job 1: Raw to Processed (Bronze → Silver)
+With proper logging and exception handling
 """
 
 import sys
+import logging
 from datetime import datetime
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.context import SparkContext
-from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, IntegerType, StringType
+from pyspark.sql.functions import (
+    col, to_date, when, upper, trim, lit, 
+    current_timestamp, input_file_name, coalesce
+)
+from pyspark.sql.types import DoubleType, IntegerType
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+# AWS Docs: https://docs.aws.amazon.com/glue/latest/dg/monitor-continuous-logging.html
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('glue_job_1_raw_to_processed')
 
 # =============================================================================
 # INITIALIZE GLUE CONTEXT
 # =============================================================================
-args = getResolvedOptions(sys.argv, ['JOB_NAME', 'source_bucket', 'target_bucket'])
 
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+try:
+    args = getResolvedOptions(sys.argv, ['JOB_NAME', 'SOURCE_BUCKET', 'TARGET_BUCKET'])
+    logger.info(f"Job arguments: {args}")
+except Exception as e:
+    logger.error(f"Failed to get job arguments: {e}")
+    raise
 
-# Configuration
-SOURCE_BUCKET = args['source_bucket']
-TARGET_BUCKET = args['target_bucket']
-RAW_PATH = f"s3://{SOURCE_BUCKET}/raw/nursing_staffing/"
-PROCESSED_PATH = f"s3://{TARGET_BUCKET}/processed/nursing_staffing/"
-
-print("="*60)
-print("GLUE JOB 1: RAW TO PROCESSED (Bronze → Silver)")
-print(f"Source: {RAW_PATH}")
-print(f"Target: {PROCESSED_PATH}")
-print("="*60)
-
-# =============================================================================
-# COLUMN DEFINITIONS
-# =============================================================================
-HOUR_COLUMNS = [
-    'Hrs_RNDON', 'Hrs_RNDON_emp', 'Hrs_RNDON_ctr',
-    'Hrs_RNadmin', 'Hrs_RNadmin_emp', 'Hrs_RNadmin_ctr',
-    'Hrs_RN', 'Hrs_RN_emp', 'Hrs_RN_ctr',
-    'Hrs_LPNadmin', 'Hrs_LPNadmin_emp', 'Hrs_LPNadmin_ctr',
-    'Hrs_LPN', 'Hrs_LPN_emp', 'Hrs_LPN_ctr',
-    'Hrs_CNA', 'Hrs_CNA_emp', 'Hrs_CNA_ctr',
-    'Hrs_NAtrn', 'Hrs_NAtrn_emp', 'Hrs_NAtrn_ctr',
-    'Hrs_MedAide', 'Hrs_MedAide_emp', 'Hrs_MedAide_ctr'
-]
+try:
+    sc = SparkContext()
+    glueContext = GlueContext(sc)
+    spark = glueContext.spark_session
+    job = Job(glueContext)
+    job.init(args['JOB_NAME'], args)
+    logger.info("Glue context initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Glue context: {e}")
+    raise
 
 # =============================================================================
-# READ RAW DATA
+# CONFIGURATION
 # =============================================================================
-print("\n--- Reading Raw Data ---")
 
-df = spark.read \
-    .option("header", "true") \
-    .option("inferSchema", "false") \
-    .option("recursiveFileLookup", "true") \
-    .csv(RAW_PATH)
-
-initial_count = df.count()
-print(f"Loaded {initial_count:,} rows from raw layer")
-print(f"Columns: {len(df.columns)}")
+SOURCE_PATH = f"s3://{args['SOURCE_BUCKET']}/raw/nursing_staffing/"
+TARGET_PATH = f"s3://{args['TARGET_BUCKET']}/processed/nursing_staffing/"
 
 # =============================================================================
-# TRANSFORMATIONS
+# MAIN ETL LOGIC
 # =============================================================================
-print("\n--- Applying Transformations ---")
 
-# 1. Parse WorkDate (YYYYMMDD integer → DATE)
-print("  Parsing WorkDate...")
-df = df.withColumn(
-    "work_date",
-    F.to_date(F.col("WorkDate").cast("string"), "yyyyMMdd")
-)
+def read_source_data(path):
+    """Read CSV data from source path."""
+    logger.info(f"Reading data from: {path}")
+    try:
+        df = spark.read.option("header", "true").csv(path)
+        record_count = df.count()
+        
+        if record_count == 0:
+            raise ValueError(f"No records found in {path}")
+        
+        logger.info(f"Successfully read {record_count:,} records")
+        return df
+    
+    except Exception as e:
+        logger.error(f"Failed to read source data: {e}")
+        raise
 
-# 2. Cast hour columns to DOUBLE
-print("  Casting hour columns...")
-for col_name in HOUR_COLUMNS:
-    if col_name in df.columns:
-        df = df.withColumn(col_name.lower(), F.col(col_name).cast(DoubleType()))
 
-# 3. Cast integer columns
-print("  Casting integer columns...")
-df = df.withColumn("mds_census", F.col("MDScensus").cast(IntegerType()))
-df = df.withColumn("county_fips", F.col("COUNTY_FIPS").cast(IntegerType()))
+def validate_schema(df, required_columns):
+    """Validate that required columns exist."""
+    logger.info("Validating schema...")
+    missing = [c for c in required_columns if c.lower() not in [col.lower() for col in df.columns]]
+    
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    
+    logger.info(f"Schema validation passed. Found {len(df.columns)} columns")
+    return True
 
-# 4. Standardize string columns
-print("  Standardizing strings...")
-df = df.withColumn("provider_id", F.trim(F.col("PROVNUM")))
-df = df.withColumn("provider_name", F.trim(F.col("PROVNAME")))
-df = df.withColumn("city", F.trim(F.upper(F.col("CITY"))))
-df = df.withColumn("state", F.trim(F.upper(F.col("STATE"))))
-df = df.withColumn("county_name", F.trim(F.col("COUNTY_NAME")))
-df = df.withColumn("cy_qtr", F.trim(F.col("CY_Qtr")))
 
-# 5. Add time dimension columns
-print("  Adding time dimensions...")
-df = df.withColumn("work_year", F.year("work_date"))
-df = df.withColumn("work_month", F.month("work_date"))
-df = df.withColumn("work_day_of_week", F.dayofweek("work_date"))
+def transform_data(df):
+    """Apply all transformations."""
+    logger.info("Starting transformations...")
+    
+    try:
+        # Standardize column names to lowercase
+        for col_name in df.columns:
+            df = df.withColumnRenamed(col_name, col_name.lower())
+        
+        # Parse date
+        df = df.withColumn("work_date", to_date(col("workdate").cast("string"), "yyyyMMdd"))
+        
+        # Cast numeric columns
+        hour_columns = [c for c in df.columns if c.startswith('hrs_')]
+        for col_name in hour_columns:
+            df = df.withColumn(col_name, col(col_name).cast(DoubleType()))
+        
+        df = df.withColumn("mdscensus", col("mdscensus").cast(IntegerType()))
+        
+        # Standardize strings
+        df = df.withColumn("state", upper(trim(col("state"))))
+        
+        # Calculate metrics
+        df = df.withColumn("total_nursing_hours",
+            coalesce(col("hrs_rn"), lit(0)) +
+            coalesce(col("hrs_lpn"), lit(0)) +
+            coalesce(col("hrs_cna"), lit(0))
+        )
+        
+        df = df.withColumn("nursing_hppd",
+            when(col("mdscensus") > 0,
+                 col("total_nursing_hours") / col("mdscensus"))
+            .otherwise(None)
+        )
+        
+        # Add metadata
+        df = df.withColumn("processed_at", current_timestamp())
+        df = df.withColumn("source_file", input_file_name())
+        
+        logger.info("Transformations completed successfully")
+        return df
+    
+    except Exception as e:
+        logger.error(f"Transformation failed: {e}")
+        raise
 
-# 6. Calculate total nursing hours
-print("  Calculating total nursing hours...")
-df = df.withColumn(
-    "total_nursing_hours",
-    F.coalesce(F.col("hrs_rn"), F.lit(0.0)) +
-    F.coalesce(F.col("hrs_lpn"), F.lit(0.0)) +
-    F.coalesce(F.col("hrs_cna"), F.lit(0.0))
-)
 
-# 7. Calculate employed vs contract hours
-df = df.withColumn(
-    "total_employed_hours",
-    F.coalesce(F.col("hrs_rn_emp"), F.lit(0.0)) +
-    F.coalesce(F.col("hrs_lpn_emp"), F.lit(0.0)) +
-    F.coalesce(F.col("hrs_cna_emp"), F.lit(0.0))
-)
+def write_output(df, path):
+    """Write data to target path as Parquet."""
+    logger.info(f"Writing data to: {path}")
+    
+    try:
+        df.write \
+            .mode("overwrite") \
+            .partitionBy("cy_qtr", "state") \
+            .parquet(path)
+        
+        logger.info("Write completed successfully")
+    
+    except Exception as e:
+        logger.error(f"Failed to write output: {e}")
+        raise
 
-df = df.withColumn(
-    "total_contract_hours",
-    F.coalesce(F.col("hrs_rn_ctr"), F.lit(0.0)) +
-    F.coalesce(F.col("hrs_lpn_ctr"), F.lit(0.0)) +
-    F.coalesce(F.col("hrs_cna_ctr"), F.lit(0.0))
-)
 
-# 8. Calculate HPPD (Hours Per Patient Day)
-print("  Calculating HPPD...")
-df = df.withColumn(
-    "nursing_hppd",
-    F.when(
-        F.col("mds_census") > 0,
-        F.round(F.col("total_nursing_hours") / F.col("mds_census"), 2)
-    ).otherwise(F.lit(None))
-)
+def main():
+    """Main ETL function."""
+    logger.info("=" * 50)
+    logger.info("STARTING GLUE JOB 1: Raw to Processed")
+    logger.info("=" * 50)
+    
+    required_columns = ['provnum', 'state', 'workdate', 'mdscensus', 'hrs_rn', 'hrs_lpn', 'hrs_cna']
+    
+    try:
+        # Extract
+        df = read_source_data(SOURCE_PATH)
+        
+        # Validate
+        validate_schema(df, required_columns)
+        
+        # Transform
+        df_transformed = transform_data(df)
+        
+        # Load
+        write_output(df_transformed, TARGET_PATH)
+        
+        logger.info("=" * 50)
+        logger.info("JOB COMPLETED SUCCESSFULLY")
+        logger.info("=" * 50)
+        
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        raise
+    
+    except Exception as e:
+        logger.error(f"Job failed: {e}")
+        raise
+    
+    finally:
+        job.commit()
 
-# 9. Calculate contract ratio
-df = df.withColumn(
-    "contract_ratio",
-    F.when(
-        F.col("total_nursing_hours") > 0,
-        F.round(F.col("total_contract_hours") / F.col("total_nursing_hours"), 4)
-    ).otherwise(F.lit(0.0))
-)
 
-# 10. Add metadata columns
-print("  Adding metadata...")
-df = df.withColumn("processed_at", F.current_timestamp())
-df = df.withColumn("source_file", F.input_file_name())
-
-# 11. Filter invalid records
-print("  Filtering invalid records...")
-invalid_dates = df.filter(F.col("work_date").isNull()).count()
-if invalid_dates > 0:
-    print(f"  WARNING: Removing {invalid_dates} rows with invalid dates")
-
-df = df.filter(F.col("work_date").isNotNull())
-
-# =============================================================================
-# SELECT FINAL COLUMNS
-# =============================================================================
-print("\n--- Selecting Final Columns ---")
-
-# Build column list
-final_columns = [
-    # Identifiers
-    "provider_id", "provider_name", "city", "state", "county_name", "county_fips",
-    # Time
-    "cy_qtr", "work_date", "work_year", "work_month", "work_day_of_week",
-    # Census
-    "mds_census",
-]
-
-# Add all hour columns (lowercase)
-for col_name in HOUR_COLUMNS:
-    lc = col_name.lower()
-    if lc in df.columns:
-        final_columns.append(lc)
-
-# Add calculated and metadata columns
-final_columns.extend([
-    "total_nursing_hours", "total_employed_hours", "total_contract_hours",
-    "nursing_hppd", "contract_ratio",
-    "processed_at", "source_file"
-])
-
-df_final = df.select(*[c for c in final_columns if c in df.columns])
-
-# =============================================================================
-# DATA QUALITY CHECKS
-# =============================================================================
-print("\n--- Data Quality Checks ---")
-
-final_count = df_final.count()
-print(f"Final row count: {final_count:,}")
-
-# Key column null checks
-for col in ['provider_id', 'work_date', 'state', 'mds_census']:
-    if col in df_final.columns:
-        null_count = df_final.filter(F.col(col).isNull()).count()
-        pct = (null_count / final_count) * 100 if final_count > 0 else 0
-        status = "✓" if pct == 0 else "⚠"
-        print(f"  {status} {col}: {null_count:,} nulls ({pct:.2f}%)")
-
-# Date range
-date_stats = df_final.agg(
-    F.min("work_date").alias("min_date"),
-    F.max("work_date").alias("max_date")
-).collect()[0]
-print(f"  Date range: {date_stats['min_date']} to {date_stats['max_date']}")
-
-# Provider count
-provider_count = df_final.select("provider_id").distinct().count()
-print(f"  Unique providers: {provider_count:,}")
-
-# State count
-state_count = df_final.select("state").distinct().count()
-print(f"  Unique states: {state_count}")
-
-# =============================================================================
-# WRITE TO PROCESSED LAYER
-# =============================================================================
-print("\n--- Writing to Processed Layer ---")
-print(f"Output path: {PROCESSED_PATH}")
-print("Partitioning by: cy_qtr, state")
-
-df_final.write \
-    .mode("overwrite") \
-    .partitionBy("cy_qtr", "state") \
-    .option("compression", "snappy") \
-    .parquet(PROCESSED_PATH)
-
-print("Write complete!")
-
-# =============================================================================
-# JOB COMPLETE
-# =============================================================================
-print("\n" + "="*60)
-print("JOB COMPLETED SUCCESSFULLY")
-print(f"Rows processed: {final_count:,}")
-print(f"Output: {PROCESSED_PATH}")
-print("="*60)
-
-job.commit()
+if __name__ == "__main__":
+    main()
