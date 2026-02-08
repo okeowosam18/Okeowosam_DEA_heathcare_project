@@ -234,3 +234,186 @@ Outputs:
   RedshiftNamespaceName:
     Description: 'Redshift Serverless Namespace Name'
     Value: !Sub '${ProjectName}-namespace'
+    
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # SNS TOPIC FOR ALERTS
+  # ---------------------------------------------------------------------------
+  PipelineAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-pipeline-alerts'
+
+  PipelineAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PipelineAlertTopic
+      Protocol: email
+      Endpoint: your-email@example.com  # Change this!
+
+  # ---------------------------------------------------------------------------
+  # STEP FUNCTIONS IAM ROLE
+  # ---------------------------------------------------------------------------
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PipelineAlertTopic
+
+  # ---------------------------------------------------------------------------
+  # STEP FUNCTIONS STATE MACHINE
+  # ---------------------------------------------------------------------------
+  # This orchestrates: Job1 → Job2 → Crawler with retry/failure handling
+  # ---------------------------------------------------------------------------
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-pipeline'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        Comment: "Healthcare Metrics ETL Pipeline"
+        StartAt: RunGlueJob1
+        States:
+          
+          # Step 1: Raw → Processed
+          RunGlueJob1:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Sub '${ProjectName}-raw-to-processed'
+            Retry:
+              - ErrorEquals: ["Glue.ConcurrentRunsExceededException"]
+                IntervalSeconds: 60
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: "$.error"
+                Next: NotifyFailure
+            Next: RunGlueJob2
+          
+          # Step 2: Processed → Curated
+          RunGlueJob2:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Sub '${ProjectName}-processed-to-curated'
+            Retry:
+              - ErrorEquals: ["Glue.ConcurrentRunsExceededException"]
+                IntervalSeconds: 60
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: "$.error"
+                Next: NotifyFailure
+            Next: RunCrawler
+          
+          # Step 3: Update Catalog
+          RunCrawler:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:glue:startCrawler
+            Parameters:
+              Name: !Sub '${ProjectName}-curated-crawler'
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: "$.error"
+                Next: NotifyFailure
+            Next: PipelineSuccess
+          
+          # Success notification
+          PipelineSuccess:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: !Ref PipelineAlertTopic
+              Subject: "✅ Healthcare Pipeline SUCCESS"
+              Message: "Pipeline completed successfully."
+            End: true
+          
+          # Failure notification
+          NotifyFailure:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: !Ref PipelineAlertTopic
+              Subject: "❌ Healthcare Pipeline FAILED"
+              Message.$: "States.Format('Pipeline failed. Error: {}', $.error)"
+            Next: FailPipeline
+          
+          FailPipeline:
+            Type: Fail
+            Error: "PipelineFailure"
+            Cause: "One or more steps failed"
+
+  # ---------------------------------------------------------------------------
+  # EVENTBRIDGE RULE - SCHEDULED TRIGGER (Daily at 6 AM UTC)
+  # ---------------------------------------------------------------------------
+  DailyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-trigger'
+      Description: "Trigger pipeline daily at 6 AM UTC"
+      ScheduleExpression: "cron(0 6 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: TriggerPipeline
+          Arn: !GetAtt PipelineStateMachine.Arn
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # EVENTBRIDGE IAM ROLE
+  # ---------------------------------------------------------------------------
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeStepFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !GetAtt PipelineStateMachine.Arn
+
+Outputs:
+  StateMachineArn:
+    Description: "Step Functions State Machine ARN"
+    Value: !GetAtt PipelineStateMachine.Arn
+  
+  AlertTopicArn:
+    Description: "SNS Alert Topic ARN"
+    Value: !Ref PipelineAlertTopic
